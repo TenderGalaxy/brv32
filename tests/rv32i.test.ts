@@ -50,8 +50,9 @@ test('Official RISC-V Tests', async function () {
             }
         }
         cpu.pc = forms.entry
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 1000; i++) {
             console.log(cpu.step())
         }
+        console.log(`${file}: timeout`)
     }
 })

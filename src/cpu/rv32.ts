@@ -6,9 +6,15 @@ class OOBError extends Error {
 }
 export class RV32I {
     memory: Device
-    pc = 0
     mode = 3
-    xreg = new Uint32Array(32)
+    xreg = new Uint32Array(33)
+    csr = new Uint32Array(4096)
+    get pc() {
+        return this.xreg[32]
+    }
+    set pc(val: number) {
+        this.xreg[32] = val
+    }
     constructor(memory: Device) {
         this.memory = memory
     }
@@ -17,7 +23,7 @@ export class RV32I {
         return `${this.pc} | ${this.execute()}`
     }
     execute() {
-        const instr = this.memory.read32(this.pc)
+        const instr = this.memory.read32(this.pc >>> 0)
         const opc = this.getOpcode(instr)
         switch (opc) {
             // ADDI/SLTI/SLTIU/ANDI/ORI/XORI
@@ -35,7 +41,10 @@ export class RV32I {
             // JAL
             case 0b1101111:
                 return this.opc1101111(instr)
-            // BEQ/BNE/BLT/BQE/BLTU/BGEU
+            //JALR
+            case 0b1100111:
+                return this.opc1100111(instr)
+            // BEQ/BNE/BLT/BGE/BLTU/BGEU
             case 0b1100011:
                 return this.opc1100011(instr)
             // LB/LH/LW/LBU/LHU
@@ -44,8 +53,28 @@ export class RV32I {
             // SB/SH/SW
             case 0b0100011:
                 return this.opc0100011(instr)
+            // Zicsr Instructions
+            // CSRRW/CSRRS/CSRRC/CSRRWI/CSRRSI/CSRRCI
+            case 0b1110011:
+                return this.opc1110011(instr)
+            // Zifencei
+            // FENCE.I
+            case 0b0001111:
+                return this.opc0001111(instr)
+            // M Extension
+            // MUL/MULH/MULHSU/MULHU/DIV/DIVU/REM/REMU
+            case 0b0110011:
+                return this.opc0110011(instr)
         }
         return false
+    }
+    opc0001111(instr: number) {
+        const funct3 = this.getSlice(instr, 12, 14)
+        if (funct3 == 1) {
+            this.pc += 4
+            return 'fence.i'
+        }
+        throw new OOBError(funct3)
     }
     opc0010011(opc: number) {
         this.pc += 4
@@ -55,27 +84,23 @@ export class RV32I {
                 this.xreg[rd] = this.xreg[rs1] + imm
                 return `addi ${rd} ${rs1} ${imm}`
             case 0b001:
-                this.xreg[rs1] <<= rd
-                return `srli ${rs1} ${rd}`
+                this.xreg[rd] = this.xreg[rs1] << (uimm & 31)
+                return `slli ${rs1} ${rd}`
             case 0b010:
-                if (this.xreg[rs1] < uimm) {
-                    this.xreg[rd] = 1
-                }
-                return `stli ${rd} ${rs1} ${imm}`
+                this.xreg[rd] = this.toSigned(this.xreg[rs1]) < uimm ? 1 : 0
+                return `slti ${rd} ${rs1} ${imm}`
             case 0b011:
-                if (this.toSigned(this.xreg[rs1]) < imm) {
-                    this.xreg[rd] = 1
-                }
-                return `stliu ${rd} ${rs1} ${imm}`
+                this.xreg[rd] = this.xreg[rs1] < imm ? 1 : 0
+                return `sltiu ${rd} ${rs1} ${imm}`
             case 0b100:
                 this.xreg[rd] = this.xreg[rs1] ^ imm
                 return `xori ${rd} ${rs1} ${imm}`
             case 0b101:
-                if (imm == 0) {
-                    this.xreg[rd] >>>= rd
+                if ((opc >>> 30) & 1) {
+                    this.xreg[rd] = this.xreg[rs1] >>> (uimm & 31)
                     return `srli ${rs1} ${rd}`
                 } else {
-                    this.xreg[rd] >>= rd
+                    this.xreg[rd] = this.xreg[rs1] >> (uimm & 31)
                     return `srai ${rs1} ${rd}`
                 }
             case 0b110:
@@ -100,6 +125,16 @@ export class RV32I {
         return `auipc ${rd} ${uimm}`
     }
     opc0110011(opc: number) {
+        function shdo(v: number) {
+            return (v & 0x00ff) << 16
+        }
+        function shup(v: number) {
+            return (v & 0xff00) >> 16
+        }
+        // 1 2 3 4
+        // h1 * h2: 1 2 nopi | nan
+        // h1 * l2: 2 3 shup | shdo
+        // l1 * l2: 3 4 nan | nopi
         this.pc += 4
         const { rd, funct3, rs1, rs2, funct7 } = this.getRType(opc)
         switch (funct3) {
@@ -107,49 +142,113 @@ export class RV32I {
                 if (funct7 == 0) {
                     this.xreg[rd] = this.xreg[rs1] + this.xreg[rs2]
                     return `add ${rd} ${rs1} ${rs2}`
-                } else {
+                } else if (funct7 == 0b0100000) {
                     this.xreg[rd] = this.xreg[rs1] - this.xreg[rs2]
                     return `sub ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    let h1 = rs1 >> 16,
+                        l1 = rs1 & 65535,
+                        h2 = rs2 >> 16,
+                        l2 = rs2 & 65535
+                    this.xreg[rd] = l1 * l2 + shdo(l2 * h1) + shdo(l1 * h2)
+                    return `mul ${rd} ${rs1} ${rs2}`
                 }
+                break
             case 0b001:
-                this.xreg[rd] = this.xreg[rs1] << (this.xreg[rs2] & 31)
-                return `sll ${rd} ${rs1} ${rs2}`
+                if (funct7 == 0) {
+                    this.xreg[rd] = this.xreg[rs1] << (this.xreg[rs2] & 31)
+                    return `sll ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    let h1 = this.sext(rs1 >> 16, 16),
+                        l1 = rs1 & 65535,
+                        h2 = this.sext(rs2 >> 16, 16),
+                        l2 = rs2 & 65535
+                    this.xreg[rd] = h1 * h2 + shup(l2 * h1) + shup(l1 * h2)
+                    return `mulh ${rd} ${rs1} ${rs2}`
+                }
+                break
             case 0b010:
-                if (
-                    this.toSigned(this.xreg[rs1]) <
-                    this.toSigned(this.xreg[rs2])
-                ) {
-                    this.xreg[rd] = 1
+                if (funct7 == 0) {
+                    if (
+                        this.toSigned(this.xreg[rs1]) <
+                        this.toSigned(this.xreg[rs2])
+                    ) {
+                        this.xreg[rd] = 1
+                    }
+                    return `slt ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    let h1 = this.sext(rs1 >> 16, 16),
+                        l1 = rs1 & 65535,
+                        h2 = rs2 >> 16,
+                        l2 = rs2 & 65535
+                    this.xreg[rd] = h1 * h2 + shup(l2 * h1) + shup(l1 * h2)
+                    return `mulhsu ${rd} ${rs1} ${rs2}`
                 }
-                return `slt ${rd} ${rs1} ${rs2}`
+                break
             case 0b011:
-                if (this.xreg[rs1] < this.xreg[rs2]) {
-                    this.xreg[rd] = 1
+                if (funct7 == 0) {
+                    if (this.xreg[rs1] < this.xreg[rs2]) {
+                        this.xreg[rd] = 1
+                    }
+                    return `sltu ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    let h1 = rs1 >> 16,
+                        l1 = rs1 & 65535,
+                        h2 = rs2 >> 16,
+                        l2 = rs2 & 65535
+                    this.xreg[rd] = h1 * h2 + shup(l2 * h1) + shup(l1 * h2)
+                    return `mulhu ${rd} ${rs1} ${rs2}`
                 }
-                return `sltu ${rd} ${rs1} ${rs2}`
+                break
             case 0b100:
-                this.xreg[rd] = this.xreg[rs1] ^ this.xreg[rs2]
-                return `xor ${rd} ${rs1} ${rs2}`
+                if (funct7 == 0) {
+                    this.xreg[rd] = this.xreg[rs1] ^ this.xreg[rs2]
+                    return `xor ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    this.xreg[rd] =
+                        this.toSigned(this.xreg[rs1]) /
+                        this.toSigned(this.xreg[rs2])
+                    return `div ${rd} ${rs1} ${rs2}`
+                }
+                break
             case 0b101:
                 if (funct7 == 0) {
-                    this.xreg[rd] = this.xreg[rs1] >> (this.xreg[rs2] & 31)
-                    return `srl ${rd} ${rs1} ${rs2}`
-                } else {
                     this.xreg[rd] = this.xreg[rs1] >>> (this.xreg[rs2] & 31)
+                    return `srl ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 0b0100000) {
+                    this.xreg[rd] = this.xreg[rs1] >> (this.xreg[rs2] & 31)
                     return `sra ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    this.xreg[rd] = this.xreg[rs1] / this.xreg[rs2]
+                    return `divu ${rd} ${rs1} ${rs2}`
                 }
+                break
             case 0b110:
-                this.xreg[rd] = this.xreg[rs1] | this.xreg[rs2]
-                return `or ${rd} ${rs1} ${rs2}`
+                if (funct7 == 0) {
+                    this.xreg[rd] = this.xreg[rs1] | this.xreg[rs2]
+                    return `or ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    this.xreg[rd] =
+                        this.toSigned(this.xreg[rs1]) %
+                        this.toSigned(this.xreg[rs2])
+                    return `rem ${rd} ${rs1} ${rs2}`
+                }
+                break
             case 0b111:
-                this.xreg[rd] = this.xreg[rs1] & this.xreg[rs2]
-                return `and ${rd} ${rs1} ${rs2}`
+                if (funct7 == 0) {
+                    this.xreg[rd] = this.xreg[rs1] & this.xreg[rs2]
+                    return `and ${rd} ${rs1} ${rs2}`
+                } else if (funct7 == 1) {
+                    this.xreg[rd] = this.xreg[rs1] % this.xreg[rs2]
+                    return `remu ${rd} ${rs1} ${rs2}`
+                }
+                break
         }
-        throw new OOBError(funct3)
+        throw new OOBError(`${funct3}, ${funct7}`)
     }
     opc1101111(instr: number) {
         const { rd, uimm } = this.getJType(instr)
-        const imm = this.sext(uimm, 20)
+        const imm = this.sext(uimm, 21)
         this.xreg[rd] = this.pc + 4
         this.pc += imm
         return `jal ${rd} ${imm}`
@@ -163,7 +262,7 @@ export class RV32I {
     opc1100011(instr: number) {
         // BEQ 0 BNE 1 BLT 100 BGE 101 BLTU 110 BGEU 111
         const { funct3, rs1, rs2, uimm } = this.getBType(instr)
-        const imm = this.sext(uimm, 10)
+        const imm = this.sext(uimm, 13)
         switch (funct3) {
             case 0b000:
                 if (this.xreg[rs1] == this.xreg[rs2]) {
@@ -220,7 +319,7 @@ export class RV32I {
     opc0000011(instr: number) {
         this.pc += 4
         const { rd, imm, rs1, funct3 } = this.getIType(instr)
-        const addr = this.xreg[rs1] + imm
+        const addr = (this.xreg[rs1] + imm) >>> 0
         switch (funct3) {
             case 0b000:
                 this.xreg[rd] = this.sext(this.memory.read8(addr), 8)
@@ -245,7 +344,7 @@ export class RV32I {
         this.pc += 4
         const { uimm, rs1, rs2, funct3 } = this.getSType(instr)
         const imm = this.sext(uimm, 12)
-        const addr = this.xreg[rs1] + imm
+        const addr = (this.xreg[rs1] + imm) >>> 0
         switch (funct3) {
             case 0b000:
                 this.memory.write8(addr, this.xreg[rs2])
@@ -259,12 +358,52 @@ export class RV32I {
         }
         throw new OOBError(funct3)
     }
+    opc1110011(instr: number) {
+        this.pc += 4
+        const { csr, rs1, funct3, rd } = this.getCSRType(instr)
+        switch (funct3) {
+            case 0b001: {
+                let v = this.xreg[rs1]
+                if (rd != 0) this.xreg[rd] = this.csr[csr]
+                this.csr[csr] = v
+                return `csrrw ${rd} ${csr} ${rs1}`
+            }
+            case 0b010: {
+                let v = this.csr[csr]
+                if (rs1 != 0) this.csr[csr] |= this.xreg[rs1]
+                this.xreg[rd] = v
+                return `csrrs ${rd} ${csr} ${rs1}`
+            }
+            case 0b011: {
+                let v = this.csr[csr]
+                if (rs1 != 0) this.csr[csr] &= ~this.xreg[rs1]
+                this.xreg[rd] = v
+                return `csrrc ${rd} ${csr} ${rs1}`
+            }
+            case 0b101: {
+                if (rd != 0) this.xreg[rd] = this.csr[csr]
+                this.csr[csr] = rs1
+                return `csrrwi ${rd} ${csr} ${rs1}`
+            }
+            case 0b110: {
+                this.xreg[rd] = this.csr[csr]
+                if (rs1 != 0) this.csr[csr] |= rs1
+                return `csrrsi ${rd} ${csr} ${rs1}`
+            }
+            case 0b111: {
+                this.xreg[rd] = this.csr[csr]
+                if (rs1 != 0) this.csr[csr] &= ~rs1
+                return `csrrci ${rd} ${csr} ${rs1}`
+            }
+        }
+        throw new OOBError(funct3)
+    }
 
     getOpcode(v: number) {
         return this.getSlice(v, 0, 6)
     }
     getSlice(v: number, start: number, end: number) {
-        return (v >> start) & ((1 << (end - start + 1)) - 1)
+        return (v >>> start) & ((1 << (end - start + 1)) - 1)
     }
     sext(value: number, bits: number) {
         return (value << (32 - bits)) >> (32 - bits)
@@ -324,6 +463,23 @@ export class RV32I {
                 (this.getSlice(v, 12, 19) << 12) |
                 (this.getSlice(v, 20, 20) << 11) |
                 (this.getSlice(v, 31, 31) << 20),
+        }
+    }
+    getCSRType(v: number) {
+        return {
+            rd: this.getSlice(v, 7, 11),
+            funct3: this.getSlice(v, 12, 14),
+            rs1: this.getSlice(v, 15, 19),
+            csr: this.getSlice(v, 20, 31),
+        }
+    }
+    getMULType(v: number) {
+        return {
+            rd: this.getSlice(v, 7, 11),
+            funct3: this.getSlice(v, 12, 14),
+            rs1: this.getSlice(v, 15, 19),
+            rs2: this.getSlice(v, 20, 24),
+            funct7: this.getSlice(v, 25, 31),
         }
     }
 }
